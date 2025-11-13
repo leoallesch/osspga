@@ -1,13 +1,13 @@
 import random, time, os
-from dataclasses import dataclass
-from typing import List
-import tkinter as tk
-from tkinter import filedialog, messagebox
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import numpy as np
-import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from dataclasses import dataclass
+from typing import List
 
 # ====================== INSTANCE ======================
 @dataclass
@@ -18,50 +18,26 @@ class OSSPInstance:
     name: str = "unknown"
 
     def __post_init__(self):
-        job_sums = [sum(row) for row in self.p]
-        mach_sums = [sum(self.p[j][i] for j in range(self.n)) for i in range(self.m)]
+        job_sums   = [sum(row) for row in self.p]
+        mach_sums  = [sum(self.p[j][i] for j in range(self.n)) for i in range(self.m)]
         self.LB = max(max(job_sums, default=0), max(mach_sums, default=0))
 
 
-# ====================== NON-DELAY DECODER ======================
+# ====================== EVALUATION FUNCTION ======================
 def evaluate_makespan(schedule: List[List[int]], inst: OSSPInstance) -> int:
-    job_t = [0] * inst.n
+    job_t  = [0] * inst.n
     mach_t = [0] * inst.m
     for j in range(inst.n):
         for m in schedule[j]:
             if inst.p[j][m] == 0: continue
             start = max(job_t[j], mach_t[m])
-            end = start + inst.p[j][m]
+            end   = start + inst.p[j][m]
             job_t[j] = mach_t[m] = end
     return max(job_t + mach_t)
 
 
-# ====================== LOCAL SEARCH ======================
-def local_search(chrom, inst, max_iters=2000):
-    best_ms = evaluate_makespan(chrom, inst)
-    improved = True
-    iters = 0
-    while improved and iters < max_iters:
-        improved = False
-        for j in range(inst.n):
-            seq = chrom[j]
-            if len(seq) < 2: continue
-            for i in range(len(seq)):
-                for k in range(i + 1, len(seq)):
-                    if iters >= max_iters: return best_ms
-                    seq[i], seq[k] = seq[k], seq[i]
-                    new_ms = evaluate_makespan(chrom, inst)
-                    if new_ms < best_ms:
-                        best_ms = new_ms
-                        improved = True
-                    else:
-                        seq[i], seq[k] = seq[k], seq[i]
-                    iters += 1
-    return best_ms
-
-
 # ====================== SUPPORT FUNCTIONS ======================
-def create_individual(inst):
+def create_individual(inst: OSSPInstance):
     ind = []
     for j in range(inst.n):
         ops = [m for m in range(inst.m) if inst.p[j][m] > 0]
@@ -90,86 +66,99 @@ def mutate(chrom, rate=0.4):
             row[i], row[j] = row[j], row[i]
 
 
-def build_adjacency(best_chrom, inst):
-    adj = [[0] * inst.m for _ in range(inst.m)]
-    for seq in best_chrom:
-        for a, b in zip(seq[:-1], seq[1:]):
-            adj[a][b] += 1
-    return adj
+# ----- population consensus (wisdom of crowds) -----
+def population_consensus(population: List[List[List[int]]], inst: OSSPInstance):
+    n = inst.n
+    consensus = [[] for _ in range(n)]
+    for j in range(n):
+        sequences = [tuple(ind[j]) for ind in population if ind[j]]
+        if not sequences:
+            continue
+        cnt = {}
+        for seq in sequences:
+            cnt[seq] = cnt.get(seq, 0) + 1
+        best_seq = max(cnt.items(), key=lambda x: x[1])[0]
+        consensus[j] = list(best_seq)
+    return consensus
 
 
-# ====================== GENETIC ALGORITHM ======================
+# ====================== GENETIC ALGORITHM (NO LOCAL SEARCH) ======================
 def genetic_algorithm(inst,
                       pop_size=200,
                       max_stagnant_gens=200,
                       hard_timeout=120.0,
                       wisdom_of_crowds=True,
-                      collect_history=False):
+                      collect_history=False,
+                      random_restart=False):
+    # ----- initialise -----
     population = [create_individual(inst) for _ in range(pop_size)]
     best_chrom = create_individual(inst)
-    best_ms = evaluate_makespan(best_chrom, inst)
-    history = [best_ms] if collect_history else None
-    adjacency = [[0] * inst.m for _ in range(inst.m)]
+    best_ms    = evaluate_makespan(best_chrom, inst)
+    history    = [best_ms] if collect_history else None
     start_time = time.time()
     last_improve_gen = 0
     gen = 0
 
     while True:
         gen += 1
-        now = time.time()
-        elapsed = now - start_time
+        elapsed = time.time() - start_time
         stagnant_gens = gen - last_improve_gen
 
+        # ----- termination -----
         if best_ms <= inst.LB: break
         if stagnant_gens >= max_stagnant_gens: break
         if elapsed >= hard_timeout: break
 
+        # ----- evaluate population -----
         makespans = [evaluate_makespan(ch, inst) for ch in population]
         min_ms = min(makespans)
 
-        if min_ms < best_ms:
+        if min_ms < best_ms:                     # new global best
             best_ms = min_ms
             best_idx = makespans.index(min_ms)
             best_chrom = [row[:] for row in population[best_idx]]
-            adjacency = build_adjacency(best_chrom, inst)
-            improved_ms = local_search(best_chrom, inst, max_iters=2000)
-            if improved_ms < best_ms:
-                best_ms = improved_ms
-            if collect_history: history.append(best_ms)
             last_improve_gen = gen
+            if collect_history: history.append(best_ms)
         else:
             if collect_history: history.append(best_ms)
 
-        if wisdom_of_crowds and stagnant_gens > 25 and random.random() < 0.6:
-            population = [create_individual(inst) for _ in range(int(pop_size * 0.75))] + \
-                         [best_chrom] * (pop_size // 4)
+        # ----- random restarts -----
+        if random_restart and stagnant_gens > max_stagnant_gens / 2 and random.random() < 0.6:
+            population = ([create_individual(inst)
+                          for _ in range(int(pop_size * 0.75))] +
+                         [best_chrom] * (pop_size // 4))
             random.shuffle(population)
 
-        survivors = [min(random.sample(list(zip(population, makespans)), 5),
-                         key=lambda x: x[1])[0] for _ in range(pop_size)]
+        # ----- selection (tournament) -----
+        survivors = [
+            min(random.sample(list(zip(population, makespans)), 5),
+                key=lambda x: x[1])[0]
+            for _ in range(pop_size)
+        ]
 
-        offspring = [best_chrom]
+        # ----- reproduction -----
+        offspring = [best_chrom]                     # elitism
         for _ in range(pop_size // 2):
             p1, p2 = random.sample(survivors, 2)
             c1, c2 = crossover([r[:] for r in p1], [r[:] for r in p2])
             mutate(c1); mutate(c2)
             offspring.extend([c1, c2])
 
-        for chrom in offspring[1:]:
-            if random.random() < 0.35:
-                for seq in chrom:
-                    if len(seq) > 2 and random.random() < 0.6:
+        # ----- consensus-guided mutation -----
+        if wisdom_of_crowds:
+            consensus = population_consensus(population, inst)
+            for chrom in offspring[1:]:
+                if random.random() < 0.35:
+                    for j, seq in enumerate(chrom):
+                        if len(seq) <= 2: continue
                         i = random.randrange(len(seq) - 1)
-                        if wisdom_of_crowds and adjacency[seq[i]][seq[i + 1]] < 2:
-                            seq[i], seq[i + 1] = seq[i + 1], seq[i]
+                        a, b = seq[i], seq[i + 1]
+                        cons_seq = consensus[j]
+                        if cons_seq and a in cons_seq and b in cons_seq:
+                            if cons_seq.index(a) > cons_seq.index(b):
+                                seq[i], seq[i + 1] = seq[i + 1], seq[i]
 
         population = offspring[:pop_size]
-
-    final_ms = local_search(best_chrom, inst, max_iters=10000)
-    if final_ms < best_ms:
-        best_ms = final_ms
-    if collect_history and (not history or history[-1] != best_ms):
-        history.append(best_ms)
 
     return best_ms, best_chrom, history, gen, time.time() - start_time
 
@@ -213,15 +202,16 @@ class OSSPGUI(tk.Tk):
         self.instance = None
         self.selected_files = []
         self.experiment_data = None
-        self.current_fig = None  # Always holds the figure currently displayed
+        self.current_fig = None
         self.canvas = None
         self.setup_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+    # ----- UI setup -----
     def setup_ui(self):
         toolbar = tk.Frame(self); toolbar.pack(pady=10, fill=tk.X)
 
-        # ---------- SINGLE FILE ----------
+        # ----- Single file input -----
         single_f = tk.LabelFrame(toolbar, text="Single File Input", padx=10, pady=5)
         single_f.pack(fill=tk.X, pady=2)
         tk.Label(single_f, text="OSSP File:").pack(side=tk.LEFT)
@@ -230,7 +220,7 @@ class OSSPGUI(tk.Tk):
         tk.Button(single_f, text="Browse", command=self.browse_file).pack(side=tk.LEFT)
         tk.Button(single_f, text="Load", command=self.load_file).pack(side=tk.LEFT, padx=5)
 
-        # ---------- EXPERIMENT FILES ----------
+        # ----- Experiment files -----
         exp_f = tk.LabelFrame(toolbar, text="Experiment Files", padx=10, pady=5)
         exp_f.pack(fill=tk.X, pady=2)
         tk.Button(exp_f, text="Add Files", command=self.add_files).pack(side=tk.LEFT, padx=5)
@@ -238,47 +228,41 @@ class OSSPGUI(tk.Tk):
         self.file_listbox.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         tk.Button(exp_f, text="Clear", command=self.clear_files).pack(side=tk.LEFT)
 
-        # ---------- PARAMETERS ----------
+        # ----- Parameters -----
         param_f = tk.Frame(toolbar); param_f.pack(fill=tk.X, pady=2)
         tk.Label(param_f, text="Pop Size:").pack(side=tk.LEFT)
         self.pop_var = tk.IntVar(value=200)
         tk.Entry(param_f, textvariable=self.pop_var, width=6).pack(side=tk.LEFT, padx=5)
-
         tk.Label(param_f, text="Stagnant Gens:").pack(side=tk.LEFT, padx=(20,2))
         self.stag_var = tk.IntVar(value=200)
         tk.Entry(param_f, textvariable=self.stag_var, width=6).pack(side=tk.LEFT, padx=5)
-
         tk.Label(param_f, text="Timeout (s):").pack(side=tk.LEFT, padx=(20,2))
         self.time_var = tk.IntVar(value=120)
         tk.Entry(param_f, textvariable=self.time_var, width=6).pack(side=tk.LEFT, padx=5)
-
         self.woc_enabled_var = tk.BooleanVar(value=True)
         tk.Checkbutton(param_f, text="Enable Wisdom-of-Crowds", variable=self.woc_enabled_var).pack(side=tk.LEFT, padx=20)
-
+        self.random_restart_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(param_f, text="Enable Random Restarts", variable=self.random_restart_var).pack(side=tk.LEFT, padx=20)
         tk.Label(param_f, text="Runs per Variant:").pack(side=tk.LEFT, padx=(20,2))
         self.runs_var = tk.IntVar(value=5)
         tk.Entry(param_f, textvariable=self.runs_var, width=6).pack(side=tk.LEFT, padx=5)
 
-        # ---------- CONTROLS ----------
+        # ----- Controls -----
         ctrl_f = tk.Frame(toolbar); ctrl_f.pack(fill=tk.X, pady=2)
         tk.Button(ctrl_f, text="Run Single", command=self.run_single).pack(side=tk.LEFT, padx=5)
         tk.Button(ctrl_f, text="Run Experiment", command=self.run_experiment).pack(side=tk.LEFT, padx=5)
         tk.Button(ctrl_f, text="Export Figure", command=self.export_current_figure).pack(side=tk.LEFT, padx=5)
 
-        # ---------- PLOTS ----------
+        # ----- Results area -----
         results_f = tk.Frame(self); results_f.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.info_lbl = tk.Label(results_f, text="No file loaded", justify=tk.LEFT,
                                  anchor="w", fg="gray", font=("Helvetica", 10))
         self.info_lbl.pack(fill=tk.X, pady=5)
-
-        # Single canvas for all figures
         self.current_fig = Figure(figsize=(13, 8))
         self.canvas = FigureCanvasTkAgg(self.current_fig, results_f)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-    # ------------------------------------------------------------------
-    # File handling
-    # ------------------------------------------------------------------
+    # ----- File handling -----
     def browse_file(self):
         f = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")],
                                        initialdir="ossp_instances")
@@ -317,13 +301,10 @@ class OSSPGUI(tk.Tk):
         self.info_lbl.config(text=txt, fg="black" if self.selected_files else "gray")
 
     def reset_plot(self):
-        """Clear current figure and prepare for new content"""
         self.current_fig.clear()
         self.canvas.draw()
 
-    # ------------------------------------------------------------------
-    # SINGLE RUN → Gantt + Convergence
-    # ------------------------------------------------------------------
+    # ----- Single run: Gantt + Convergence -----
     def run_single(self):
         if not self.instance: return messagebox.showerror("Error", "Load a file first.")
         try:
@@ -331,15 +312,16 @@ class OSSPGUI(tk.Tk):
             stag = self.stag_var.get()
             timeout = self.time_var.get()
             woc = self.woc_enabled_var.get()
+            random_restart = self.random_restart_var.get()
             self.info_lbl.config(text="Running single GA... (please wait)", fg="blue")
             self.update_idletasks()
-
             self.reset_plot()
+
             ax1 = self.current_fig.add_subplot(121)
             ax2 = self.current_fig.add_subplot(122)
 
             ms, sched, hist, gens, elapsed = genetic_algorithm(
-                self.instance, pop, stag, timeout, woc, collect_history=True)
+                self.instance, pop, stag, timeout, woc, collect_history=True, random_restart=random_restart)
 
             # Gantt
             plot_gantt(ax1, sched, self.instance)
@@ -352,15 +334,12 @@ class OSSPGUI(tk.Tk):
 
             gap = (ms - self.instance.LB) / self.instance.LB * 100
             self.info_lbl.config(text=f"{self.instance.name} | MS={ms} | Gap={gap:.2f}% | {gens} gens | {elapsed:.2f}s", fg="darkgreen")
-
             self.current_fig.tight_layout(pad=3)
             self.canvas.draw()
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    # ------------------------------------------------------------------
-    # EXPERIMENT
-    # ------------------------------------------------------------------
+    # ----- Experiment: Compare GA vs GA+WOC -----
     def run_experiment(self):
         if len(self.selected_files) == 0:
             return messagebox.showerror("Error", "Add at least one file for experiment.")
@@ -369,6 +348,7 @@ class OSSPGUI(tk.Tk):
             pop = self.pop_var.get()
             stag = self.stag_var.get()
             timeout = self.time_var.get()
+            random_restart = self.random_restart_var.get()
             total_runs = len(self.selected_files) * runs * 2
             current = 0
             rows = []
@@ -384,81 +364,90 @@ class OSSPGUI(tk.Tk):
                 inst = OSSPInstance(n, m, p, os.path.basename(path))
 
                 # GA Only
-                ga_ms, ga_t = [], []
+                ga_ms, ga_gens, ga_t = [], [], []
                 for i in range(runs):
                     current += 1
                     self.info_lbl.config(text=f"{inst.name} | GA {i+1}/{runs} | {current}/{total_runs}")
                     self.update_idletasks()
-                    ms, _, _, _, t = genetic_algorithm(inst, pop, stag, timeout, wisdom_of_crowds=False)
-                    ga_ms.append(ms); ga_t.append(t)
+                    ms, _, _, gens, t = genetic_algorithm(inst, pop, stag, timeout, wisdom_of_crowds=False, random_restart=random_restart)
+                    ga_ms.append(ms); ga_gens.append(gens); ga_t.append(t)
 
                 # GA + WOC
-                woc_ms, woc_t = [], []
+                woc_ms, woc_gens, woc_t = [], [], []
                 for i in range(runs):
                     current += 1
                     self.info_lbl.config(text=f"{inst.name} | WOC {i+1}/{runs} | {current}/{total_runs}")
                     self.update_idletasks()
-                    ms, _, _, _, t = genetic_algorithm(inst, pop, stag, timeout, wisdom_of_crowds=True)
-                    woc_ms.append(ms); woc_t.append(t)
+                    ms, _, _, gens, t = genetic_algorithm(inst, pop, stag, timeout, wisdom_of_crowds=True, random_restart=random_restart)
+                    woc_ms.append(ms); woc_gens.append(gens); woc_t.append(t)
 
                 ga_avg = np.mean(ga_ms); woc_avg = np.mean(woc_ms)
                 imp = (ga_avg - woc_avg) / ga_avg * 100 if ga_avg else 0
+
                 rows.append({
                     'size': f"{n}×{m}",
-                    'ga_avg': round(ga_avg, 1),
-                    'ga_std': round(np.std(ga_ms), 1),
+                    'lb': inst.LB,
+                    'n_jobs': n,           # for sorting
+                    'n_mach': m,           # secondary sort key
+                    'ga_avg': f"{round(ga_avg, 1)} ± {round(np.std(ga_ms), 1)}",
+                    'ga_gens': round(np.mean(ga_gens), 1),
                     'ga_time': round(np.mean(ga_t), 2),
-                    'woc_avg': round(woc_avg, 1),
-                    'woc_std': round(np.std(woc_ms), 1),
+                    'woc_avg': f"{round(woc_avg, 1)} ± {round(np.std(woc_ms), 1)}",
+                    'woc_gens': round(np.mean(woc_gens), 1),
                     'woc_time': round(np.mean(woc_t), 2),
                     'imp_%': round(imp, 2)
                 })
 
+            # ----- Convert to DataFrame and sort by n_jobs, then n_mach -----
             self.experiment_data = pd.DataFrame(rows)
+            self.experiment_data = self.experiment_data.sort_values(by=['n_jobs', 'n_mach']).reset_index(drop=True)
 
-            # Reset and show BIG table
+            # ----- Display results table with title -----
             self.reset_plot()
             ax = self.current_fig.add_subplot(111)
             ax.axis('off')
 
+            title = f"GA vs GA+WOC | Pop. Size: {pop} | {runs} Runs per Variant | Random Restart: {random_restart} | Stagnant Gen. Limit: {stag}"
+            ax.text(0.5, 0.98, title, ha='center', va='top', fontsize=14, fontweight='bold',
+                    transform=ax.transAxes, color='#1f4e79')
+
             df_disp = self.experiment_data.copy()
             df_disp['imp_%'] = df_disp['imp_%'].apply(lambda x: f"{x:+.2f}%")
 
-            col_labels = ['Size', 'GA', '±', 't(s)', 'WOC', '±', 't(s)', 'Imp%']
-            table_data = df_disp[['size','ga_avg','ga_std','ga_time','woc_avg','woc_std','woc_time','imp_%']].values
+            col_labels = ['Size', 'LB', 'GA', 'Gens', 't(s)', 'WOC', 'Gens', 't(s)', 'Imp%']
+            table_data = df_disp[['size','lb','ga_avg','ga_gens','ga_time',
+                                  'woc_avg','woc_gens','woc_time','imp_%']].values
 
             table = ax.table(cellText=table_data, colLabels=col_labels,
-                             cellLoc='center', loc='center', bbox=[0, 0, 1, 1])
-
+                             cellLoc='center', loc='center', bbox=[0.05, 0.1, 0.9, 0.8])
             table.auto_set_font_size(False)
-            table.set_fontsize(16)
-            table.scale(1.4, 3.5)
+            table.set_fontsize(14)
+            table.scale(1.0, 3.0)
 
+            # Header style
             for i in range(len(col_labels)):
                 table[(0, i)].set_facecolor("#1f4e79")
-                table[(0, i)].set_text_props(weight='bold', color='white', fontsize=16)
+                table[(0, i)].set_text_props(weight='bold', color='white', fontsize=14)
 
+            # Improvement column highlight
             for i in range(1, len(df_disp)+1):
-                table[(i, 7)].set_facecolor("#d5f4e6")
-                table[(i, 7)].set_text_props(weight='bold', color='darkgreen', fontsize=16)
+                table[(i, 8)].set_facecolor("#d5f4e6")
+                table[(i, 8)].set_text_props(weight='bold', color='darkgreen', fontsize=14)
 
             self.current_fig.tight_layout()
             self.canvas.draw()
-
             self.info_lbl.config(text=f"Experiment complete! Click 'Export Figure' to save.", fg="darkgreen")
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    # ------------------------------------------------------------------
-    # EXPORT CURRENT FIGURE
-    # ------------------------------------------------------------------
+    # ----- Export figure -----
     def export_current_figure(self):
         if not self.current_fig or not self.current_fig.axes:
             return messagebox.showerror("Error", "Nothing to export. Run a task first.")
         f = filedialog.asksaveasfilename(
             defaultextension=".png",
             filetypes=[("PNG Image", "*.png")],
-            initialfile="ossp_result.png"
+            initialfile="ossp_experiment_result.png"
         )
         if f:
             self.current_fig.savefig(f, bbox_inches='tight', dpi=300)
